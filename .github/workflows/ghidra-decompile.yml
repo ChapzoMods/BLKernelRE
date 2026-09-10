@@ -1,0 +1,74 @@
+# Fase 2 — Ghidra headless: decompilación C completa del binario
+# Descarga el último release público de Ghidra, importa la muestra y vuelca la
+# decompilación C de todas las funciones (post-script propio en scripts/ghidra_dump_decompiled.py).
+#
+# Útil para:
+#   - contrastar el análisis manual de docs/03 (inventario de funciones por RVA)
+#   - leer en pseudo-C los 440 handlers/funciones del intérprete VM
+#   - verificación independiente de la ruptura (la lógica de licencia NO está aquí:
+#     vive en el bytecode — ver docs/05)
+name: "Fase 2 — Ghidra headless (decompilación C)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  decompile:
+    name: "analyzeHeadless → C"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependencias
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends p7zip-full wget unzip jq default-jdk-headless
+
+      - name: Descargar Ghidra (último release público)
+        run: |
+          GHIDRA_URL=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest | jq -r '.assets[0].browser_download_url')
+          if [ -z "$GHIDRA_URL" ] || [ "$GHIDRA_URL" = "null" ]; then
+            echo "::error::No se pudo obtener la URL del release de Ghidra"
+            exit 1
+          fi
+          echo "Descargando: $GHIDRA_URL"
+          wget -q "$GHIDRA_URL" -O /tmp/ghidra.zip
+          unzip -q /tmp/ghidra.zip -d /opt/ghidra
+          GHIDRA_DIR=$(find /opt/ghidra -maxdepth 1 -type d -name 'ghidra_*' | head -n1)
+          echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
+          echo "Ghidra instalado en: $GHIDRA_DIR"
+
+      - name: "Desempaquetar muestra (password: infected)"
+        run: |
+          7z x -pinfected -oBLKernel sample/BLKernel.exe.zip -y > /dev/null
+          echo "7b0136c6402a3bf6c04268e2f31d98fb83ebddf4fafd6ef92785202f9898d89c  BLKernel/BLKernel.exe" | sha256sum -c -
+
+      - name: analyzeHeadless + decompilación batch
+        run: |
+          mkdir -p artifacts /tmp/ghidra_proj
+          "$GHIDRA_DIR/support/analyzeHeadless" /tmp/ghidra_proj BLKernelRE \
+            -import BLKernel/BLKernel.exe \
+            -scriptPath scripts \
+            -postScript ghidra_dump_decompiled.py artifacts/ghidra_decompiled.c \
+            -analysisTimeoutPerFile 900 \
+            -deleteProject
+
+      - name: Métricas del volcado
+        run: |
+          echo "[+] Tamaño del volcado C:"
+          wc -l -c artifacts/ghidra_decompiled.c
+          echo "[+] Funciones decompiladas:"
+          grep -c '^// FUNC ' artifacts/ghidra_decompiled.c || true
+
+      - name: Subir decompilación
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-decompilacion
+          path: artifacts/ghidra_decompiled.c
+          retention-days: 30
+          if-no-files-found: error

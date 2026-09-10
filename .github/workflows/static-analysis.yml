@@ -1,0 +1,74 @@
+# Fase 1 — Pipeline estático reproducible
+# Re-ejecuta TODO el análisis de docs/02-05 desde la muestra empaquetada:
+#   PE → strings → recursos → desensamblado anotado → ruptura del cifrado → bytecode VM
+# y verifica que los artefactos coinciden con los publicados (reproducibilidad).
+name: "Fase 1 — Análisis estático reproducible"
+
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/**', 'sample/**', '.github/workflows/static-analysis.yml']
+  pull_request:
+    paths: ['scripts/**', '.github/workflows/static-analysis.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    name: "PE → payload → bytecode VM"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependencias (Python + 7-Zip)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends p7zip-full python3-pip
+          python3 -m pip install --quiet pefile capstone
+
+      - name: "Desempaquetar muestra (password: infected)"
+        run: |
+          7z x -pinfected -oBLKernel sample/BLKernel.exe.zip -y > /dev/null
+          echo "7b0136c6402a3bf6c04268e2f31d98fb83ebddf4fafd6ef92785202f9898d89c  BLKernel/BLKernel.exe" | sha256sum -c -
+
+      - name: "1/4 — Triage PE y strings"
+        run: |
+          mkdir -p artifacts
+          python3 scripts/analyze_pe.py       | tee artifacts/log_analyze_pe.txt
+          python3 scripts/extract_strings.py   > artifacts/strings_out.txt
+          python3 scripts/analyze_sections.py  | tee artifacts/log_sections.txt
+
+      - name: "2/4 — Desensamblado anotado"
+        run: |
+          python3 scripts/disasm_all.py      | tee artifacts/log_disasm_all.txt
+          python3 scripts/xref_resolve.py    | tee artifacts/log_xref.txt
+          python3 scripts/global_xrefs.py    | tee artifacts/log_global_xrefs.txt
+
+      - name: "3/4 — Romper el cifrado (capa 1) + VM"
+        run: |
+          python3 scripts/decrypt_blkcode.py | tee artifacts/log_decrypt.txt
+          python3 scripts/vm_handlers.py     | tee artifacts/log_vm_handlers.txt
+          python3 scripts/disasm_vm.py       | tee artifacts/log_disasm_vm.txt
+
+      - name: "4/4 — Verificación de reproducibilidad"
+        run: |
+          test -s artifacts/blkcode_layer1.bin && echo "[+] payload descifrado OK"
+          test -s artifacts/vm_handler_map.txt && echo "[+] mapa de handlers OK"
+          # header del payload: magic + tamaños exactos documentados
+          python3 -c "import struct; d=open('artifacts/blkcode_layer1.bin','rb').read(); m,f1,f2=struct.unpack('<QQQ',d[:0x18]); assert m==0x770f89da30a70374 and f1==0xe9d and f2==0x1610, 'header mismatch: %s' % hex(m); print('[+] header del payload verificado (magic, 3741 B code, 5648 B RAM)')"
+          # nº de instrucciones VM documentado: 816 (grep -c '' cuenta la última línea sin \n final)
+          N=$(grep -c '' artifacts/blk_disasm.txt)
+          [ "$N" -eq 816 ] && echo "[+] bytecode VM: $N instrucciones (816 esperadas)" || { echo "[!] se esperaban 816 líneas, hay $N"; exit 1; }
+
+      - name: Subir artefactos de la ejecución
+        uses: actions/upload-artifact@v4
+        with:
+          name: estatico-artefactos
+          path: |
+            artifacts/
+          retention-days: 30
+          if-no-files-found: error

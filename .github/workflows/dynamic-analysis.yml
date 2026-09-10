@@ -1,0 +1,125 @@
+# Fase 3 — Análisis dinámico: detonación controlada
+#
+# ⚠️ Ejecuta un binario desconocido en un runner efímero de GitHub (Windows/Azure).
+#   - Solo se dispara MANUALMENTE (workflow_dispatch) y con confirmación explícita.
+#   - permissions: contents read — sin permisos de escritura para el GITHUB_TOKEN.
+#   - Sin secretos en el entorno de detonación.
+#   - Timeout de 10 min y 60 s por comando.
+#
+# Protocolo y predicciones: docs/08-analisis-dinamico.md
+name: "Fase 3 — Análisis dinámico (detonación controlada)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      detonar:
+        description: 'Ejecutar realmente el binario (detonación)'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  dinamico:
+    name: "Detonación en Windows runner (opt-in)"
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Desempaquetar muestra (password: infected)"
+        shell: pwsh
+        run: |
+          python -c "import zipfile; zipfile.ZipFile('sample/BLKernel.exe.zip').extractall('BLKernel', pwd=b'infected')"
+          $h = (Get-FileHash BLKernel/BLKernel.exe -Algorithm SHA256).Hash.ToLower()
+          "sha256 de la muestra: $h"
+          if ($h -ne '7b0136c6402a3bf6c04268e2f31d98fb83ebddf4fafd6ef92785202f9898d89c') {
+            throw 'hash de la muestra incorrecto'
+          }
+          "contexto elevado: $([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+
+      - name: Snapshot A (pre-detonación)
+        if: ${{ inputs.detonar }}
+        shell: pwsh
+        run: |
+          $procs = (Get-Process -ErrorAction SilentlyContinue | Measure-Object).Count
+          $tcp   = (Get-NetTCPConnection -ErrorAction SilentlyContinue | Measure-Object).Count
+          $temp  = (Get-ChildItem $env:TEMP -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+          "procs=$procs"  | Out-File snapshot_a.txt -Encoding utf8
+          "tcp=$tcp"      | Out-File snapshot_a.txt -Append -Encoding utf8
+          "temp_files=$temp" | Out-File snapshot_a.txt -Append -Encoding utf8
+          Get-Content snapshot_a.txt
+
+      - name: Detonación controlada (60 s por comando)
+        if: ${{ inputs.detonar }}
+        shell: pwsh
+        run: |
+          $log = 'informe-dinamico.txt'
+          "=== DETONACION CONTROLADA - $(Get-Date -Format u) ===" | Out-File $log -Encoding utf8
+          $exe = "$PWD\BLKernel\BLKernel.exe"
+          $cmds = @(
+            @{ label = 'sin argumentos';                        args = '' },
+            @{ label = 'check tester AAAA-BBBB-CCCC-DDDD';      args = '--check tester AAAA-BBBB-CCCC-DDDD' }
+          )
+          foreach ($c in $cmds) {
+            $safe = ($c.label -replace '[^a-zA-Z0-9]', '_')
+            "---- cmd: [$($c.label)] ----" | Out-File $log -Append -Encoding utf8
+            try {
+              $psi = @{
+                FilePath = $exe; PassThru = $true; NoNewWindow = $true
+                WorkingDirectory = "$PWD\BLKernel"
+                RedirectStandardOutput = "out_$safe.txt"
+                RedirectStandardError  = "err_$safe.txt"
+              }
+              if ($c.args) { $psi.ArgumentList = $c.args }
+              $p = Start-Process @psi
+              if (-not $p.WaitForExit(60000)) {
+                $p.Kill()
+                '[timeout] 60 s - proceso matado' | Out-File $log -Append -Encoding utf8
+              } else {
+                "[exit] $($p.ExitCode)" | Out-File $log -Append -Encoding utf8
+              }
+            } catch {
+              "[error] $($_.Exception.Message)" | Out-File $log -Append -Encoding utf8
+            }
+            '[stdout]' | Out-File $log -Append -Encoding utf8
+            if (Test-Path "out_$safe.txt") { Get-Content "out_$safe.txt" | Out-File $log -Append -Encoding utf8 }
+            '[stderr]' | Out-File $log -Append -Encoding utf8
+            if (Test-Path "err_$safe.txt") { Get-Content "err_$safe.txt" | Out-File $log -Append -Encoding utf8 }
+          }
+          Get-Content $log
+
+      - name: Snapshot B + diff
+        if: ${{ inputs.detonar }}
+        shell: pwsh
+        run: |
+          $a = @{}
+          Get-Content snapshot_a.txt | ForEach-Object {
+            $k, $v = $_ -split '=', 2; $a[$k] = [int]$v
+          }
+          $procs = (Get-Process -ErrorAction SilentlyContinue | Measure-Object).Count
+          $tcp   = (Get-NetTCPConnection -ErrorAction SilentlyContinue | Measure-Object).Count
+          $temp  = (Get-ChildItem $env:TEMP -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+          $log = 'informe-dinamico.txt'
+          '=== SNAPSHOT DIFF (T-1 vs T+1) ===' | Out-File $log -Append -Encoding utf8
+          "procs: $($a['procs']) -> $procs (delta $($procs - $a['procs']))" | Out-File $log -Append -Encoding utf8
+          "tcp:   $($a['tcp']) -> $tcp (delta $($tcp - $a['tcp']))"         | Out-File $log -Append -Encoding utf8
+          "temp:  $($a['temp_files']) -> $temp (delta $($temp - $a['temp_files']))" | Out-File $log -Append -Encoding utf8
+          'Recordatorio: completar la tabla de resultados de docs/08-analisis-dinamico.md (seccion 5) con estos datos.'
+          Get-Content $log
+
+      - name: Subir informe de detonación
+        if: ${{ inputs.detonar }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: informe-dinamico
+          path: |
+            informe-dinamico.txt
+            snapshot_a.txt
+            out_*.txt
+            err_*.txt
+          if-no-files-found: error
+          retention-days: 30

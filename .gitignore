@@ -1,0 +1,13 @@
+# Regenerables por el pipeline (ver .github/workflows/static-analysis.yml)
+BLKernel/
+__pycache__/
+*.pyc
+.DS_Store
+
+# En artifacts/ SOLO se versionan los artefactos documentados (lista blanca)
+artifacts/*
+!artifacts/blkcode_layer1.bin
+!artifacts/blk_disasm.txt
+!artifacts/vm_handler_map.txt
+!artifacts/res_RT_RCDATA_7.bin
+!artifacts/res_RT_MANIFEST_1.bin
